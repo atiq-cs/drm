@@ -18,7 +18,12 @@
  *
  * A slab cache is an illumos kmem cache. The Linux constructor runs on
  * every allocation, which satisfies Linux's contract (objects are freed in
- * their constructed state, so constructing again is idempotent).
+ * their constructed state, so constructing again is idempotent). For
+ * SLAB_TYPESAFE_BY_RCU caches Linux runs the constructor once per slab
+ * object precisely so that an RCU reader still looking at a freed and
+ * reallocated object never sees its lock or refcount re-initialised; here
+ * no reader can still see an object when it is reallocated, because the
+ * free reaches kmem only after a grace period (below).
  *
  * SLAB_TYPESAFE_BY_RCU: Linux keeps such objects' memory a valid object
  * of the type until a grace period after kmem_cache_free(), so RCU readers
@@ -64,6 +69,16 @@ lkpi_km_hdr(const void *p, const char *who)
 {
 	struct lkpi_kmhdr *h = (struct lkpi_kmhdr *)p - 1;
 
+	/*
+	 * A page-aligned pointer may be the first byte of a page whose
+	 * predecessor is unmapped (alloc_pages(), coherent DMA memory):
+	 * look before reading the header there.
+	 */
+	if (IS_P2ALIGNED(p, PAGE_SIZE) &&
+	    hat_getpfnum(kas.a_hat, (caddr_t)h) == PFN_INVALID) {
+		WARN(1, "%s: %p is not kmalloc() memory", who, p);
+		return (NULL);
+	}
 	if (!IS_P2ALIGNED(p, 16) || h->kh_magic != LKPI_KM_MAGIC ||
 	    (h->kh_shift != 0 && h->kh_shift != LKPI_KM_SLACK)) {
 		WARN(1, "%s: %p is not kmalloc() memory", who, p);
@@ -71,6 +86,9 @@ lkpi_km_hdr(const void *p, const char *who)
 	}
 	return (h);
 }
+
+/* Linux's KMALLOC_MAX_SIZE on x86-64 (order-10 pages). */
+#define	LKPI_KMALLOC_WAIT_MAX	(4UL * 1024 * 1024)
 
 void *
 lkpi_kmalloc(size_t size, gfp_t gfp)
@@ -83,13 +101,19 @@ lkpi_kmalloc(size_t size, gfp_t gfp)
 	if (size == 0)
 		return (ZERO_SIZE_PTR);
 	/*
-	 * Linux refuses sizes above INT_MAX; more than physical memory would
-	 * block a KM_SLEEP allocation forever.
+	 * Linux refuses sizes above INT_MAX; a quarter of physical memory or
+	 * more would block a KM_SLEEP allocation for a long time or forever.
+	 * Above LKPI_KMALLOC_WAIT_MAX (Linux's kmalloc limit; larger ones are
+	 * kvmalloc()/vmalloc() sizes, which may fail on Linux) an allocation
+	 * does not wait for memory: user-sized arrays (execbuffer) fail with
+	 * -ENOMEM instead of waiting forever.
 	 */
-	if (size > INT_MAX || LKPI_BTOP(size) >= (size_t)physmem) {
+	if (size > INT_MAX || LKPI_BTOP(size) >= (size_t)physmem / 4) {
 		WARN_ONCE(!(gfp & __GFP_NOWARN), "kmalloc: %zu bytes", size);
 		return (NULL);
 	}
+	if (size > LKPI_KMALLOC_WAIT_MAX)
+		kmflag = KM_NOSLEEP | KM_NORMALPRI;
 	total = lkpi_km_total(size);
 	base = (gfp & __GFP_ZERO) ? kmem_zalloc(total, kmflag) :
 	    kmem_alloc(total, kmflag);
@@ -106,6 +130,8 @@ void
 lkpi_kfree(const void *p)
 {
 	struct lkpi_kmhdr *h;
+	size_t total;
+	char *base;
 
 	if (ZERO_OR_NULL_PTR(p))
 		return;
@@ -114,7 +140,12 @@ lkpi_kfree(const void *p)
 	if ((h = lkpi_km_hdr(p, "kfree")) == NULL)
 		return;
 	h->kh_magic = 0;
-	kmem_free((char *)h - h->kh_shift, lkpi_km_total(h->kh_size));
+	base = (char *)h - h->kh_shift;
+	total = lkpi_km_total(h->kh_size);
+	/* virt_to_page() descriptors of the buffer's pages (lkpi_page.c). */
+	if (total >= PAGE_SIZE)
+		lkpi_page_forget_foreign(base, total);
+	kmem_free(base, total);
 }
 
 size_t

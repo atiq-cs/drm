@@ -102,6 +102,13 @@ lkpi_shmem_mem_get(struct lkpi_shmem *ls, bool sleep)
 		return (0);
 	if (ls->ls_size == 0)
 		return (-EINVAL);
+	/*
+	 * The backing is locked kernel memory (no swap): one object may not
+	 * take more than half of physical memory, or a waiting allocation
+	 * would never be satisfied. Linux would let it fail; so does this.
+	 */
+	if (ls->ls_npages > (size_t)physmem / 2)
+		return (-ENOMEM);
 	if ((m = kmem_zalloc(sizeof (*m), kmflag)) == NULL)
 		return (-ENOMEM);
 	m->sm_kva = ddi_umem_alloc(ls->ls_size,
@@ -317,11 +324,19 @@ shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
 	struct lkpi_shmem *ls;
 	struct lkpi_shmem_mem *m;
 	struct lx_page *page;
-	bool sleep = gfpflags_allow_blocking(gfp);
+	bool sleep = lkpi_gfp_may_wait(gfp);
 	int err;
 
 	if (mapping == NULL || (ls = mapping->lkpi_shmem) == NULL)
 		return (ERR_PTR(-EINVAL));
+	/*
+	 * The backing is one allocation of the whole object: a may-fail
+	 * request (__GFP_RETRY_MAYFAIL) waits for memory only for a backing
+	 * up to physmem / 8, larger ones fail instead (<linux/gfp.h>).
+	 */
+	if ((gfp & __GFP_RETRY_MAYFAIL) != 0 &&
+	    ls->ls_npages > (size_t)physmem / 8)
+		sleep = false;
 
 	mutex_enter(&ls->ls_lock);
 	if (index >= ls->ls_npages) {

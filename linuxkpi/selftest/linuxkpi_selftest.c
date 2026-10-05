@@ -8,6 +8,8 @@
  * checks from probe(): locks, workqueues (plain, ordered, delayed,
  * cancel), timers, completions, wait queues, RCU, idr/xarray, slab
  * caches, pages, and DMA scatterlists and coherent memory on the device.
+ * The concurrency tests of the scheduling, memory and reservation parts
+ * are in st_sched.c, st_mem.c and st_resv.c (st.h).
  * Every check logs "linuxkpi_selftest: ok <name>" or "FAIL <name>"; the
  * last line is "linuxkpi_selftest: done <passed> passed <failed> failed",
  * which tools/test/run-r5c-test.sh greps from the system log. The result
@@ -32,19 +34,14 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 #include <lkpi/version.h>
+#include <drm/drm_facade.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_device.h>
 
-static int st_passed, st_failed;
+#include "st.h"
 
-#define	CHECK(name, cond) do { \
-	if (cond) { \
-		st_passed++; \
-		pr_info("linuxkpi_selftest: ok %s\n", name); \
-	} else { \
-		st_failed++; \
-		pr_err("linuxkpi_selftest: FAIL %s (%s:%d)\n", name, \
-		    __FILE__, __LINE__); \
-	} \
-	} while (0)
+int st_passed, st_failed;
 
 /* --- locks ------------------------------------------------------------- */
 
@@ -87,19 +84,13 @@ struct st_work {
 	struct delayed_work dwork;
 	struct completion done;
 	atomic_t runs;
-	int order[8];
-	atomic_t next;
-	int id;
 };
 
 static void
 st_work_fn(struct work_struct *w)
 {
 	struct st_work *sw = container_of(w, struct st_work, work);
-	int slot = atomic_fetch_inc(&sw->next);
 
-	if (slot < 8)
-		sw->order[slot] = sw->id;
 	atomic_inc(&sw->runs);
 	complete(&sw->done);
 }
@@ -117,9 +108,8 @@ st_dwork_fn(struct work_struct *w)
 static void
 test_work(void)
 {
-	struct workqueue_struct *wq, *owq;
+	struct workqueue_struct *wq;
 	struct st_work *sw;
-	int i, ok;
 
 	sw = kzalloc(sizeof (*sw) * 4, GFP_KERNEL);
 	if (sw == NULL) {
@@ -127,9 +117,8 @@ test_work(void)
 		return;
 	}
 	wq = alloc_workqueue("lkpi_st", 0, 4);
-	owq = alloc_ordered_workqueue("lkpi_st_ord", 0);
-	CHECK("alloc_workqueue", wq != NULL && owq != NULL);
-	if (wq == NULL || owq == NULL)
+	CHECK("alloc_workqueue", wq != NULL);
+	if (wq == NULL)
 		goto out;
 
 	init_completion(&sw[0].done);
@@ -139,25 +128,6 @@ test_work(void)
 	    wait_for_completion_timeout(&sw[0].done, msecs_to_jiffies(5000)) > 0);
 	flush_work(&sw[0].work);
 	CHECK("work ran once", atomic_read(&sw[0].runs) == 1);
-
-	/* Ordered queue: four items of one shared order record. */
-	atomic_set(&sw[0].next, 0);
-	for (i = 0; i < 4; i++) {
-		sw[i].id = i;
-		init_completion(&sw[i].done);
-		INIT_WORK(&sw[i].work, st_work_fn);
-	}
-	for (i = 0; i < 4; i++) {
-		/* All items record into sw[0]. */
-		sw[i].work.func = st_work_fn;
-	}
-	for (i = 0; i < 4; i++)
-		(void) queue_work(owq, &sw[i].work);
-	flush_workqueue(owq);
-	ok = 1;
-	for (i = 0; i < 4; i++)
-		ok &= atomic_read(&sw[i].runs) >= 1;
-	CHECK("flush_workqueue ran all", ok);
 
 	/* Delayed work fires after its delay; cancel before it fires. */
 	init_completion(&sw[1].done);
@@ -174,8 +144,6 @@ test_work(void)
 	    cancel_delayed_work_sync(&sw[2].dwork));
 	CHECK("cancelled work did not run", atomic_read(&sw[2].runs) == 0);
 out:
-	if (owq != NULL)
-		destroy_workqueue(owq);
 	if (wq != NULL)
 		destroy_workqueue(wq);
 	kfree(sw);
@@ -341,7 +309,7 @@ test_dma(struct pci_dev *pdev)
 	struct scatterlist *sg;
 	dma_addr_t handle = 0;
 	void *coherent;
-	int i, n, ok;
+	int i, j, n, ok;
 
 	CHECK("dma_set_mask_and_coherent(39)",
 	    dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(39)) == 0);
@@ -354,13 +322,17 @@ test_dma(struct pci_dev *pdev)
 	CHECK("alloc_page", i == ST_PAGES);
 	if (i != ST_PAGES)
 		goto free_pages;
-	CHECK("sg_alloc_table", sg_alloc_table(&st, ST_PAGES, GFP_KERNEL) == 0);
-	for_each_sg(st.sgl, sg, ST_PAGES, i)
-		sg_set_page(sg, pages[i], PAGE_SIZE, 0);
+	/* i counts the pages to free: the sg loops use j. */
+	n = sg_alloc_table(&st, ST_PAGES, GFP_KERNEL);
+	CHECK("sg_alloc_table", n == 0);
+	if (n != 0)
+		goto free_pages;
+	for_each_sg(st.sgl, sg, ST_PAGES, j)
+		sg_set_page(sg, pages[j], PAGE_SIZE, 0);
 	n = dma_map_sg(&pdev->dev, st.sgl, ST_PAGES, DMA_BIDIRECTIONAL);
 	CHECK("dma_map_sg maps every entry", n == ST_PAGES);
 	ok = n > 0;
-	for_each_sg(st.sgl, sg, n, i) {
+	for_each_sg(st.sgl, sg, n, j) {
 		ok &= sg_dma_address(sg) != 0 && sg_dma_len(sg) == PAGE_SIZE &&
 		    (sg_dma_address(sg) & (PAGE_SIZE - 1)) == 0 &&
 		    sg_dma_address(sg) < DMA_BIT_MASK(39);
@@ -383,6 +355,86 @@ free_pages:
 		__free_page(pages[i]);
 }
 
+/* --- a DRM device on the layer (the i915n lifecycle) ---------------------- */
+
+/*
+ * As i915 does: the DRM device is allocated with devm_drm_dev_alloc(), a
+ * GEM object is made before drm_dev_register() and freed only in the
+ * driver's release, remove() unplugs the device, and the last put (the
+ * devres action) runs the release and then unregisters. The guest test
+ * holds a node open across one detach attempt (refused) and checks the
+ * log line of the release at the successful one.
+ */
+struct st_drm {
+	struct drm_device drm;
+	struct drm_gem_object *obj;
+};
+
+static struct st_drm *st_drm_dev;
+
+static void
+st_obj_free(struct drm_gem_object *obj)
+{
+	kfree(obj);
+}
+
+static ddi_umem_cookie_t
+st_obj_umem(struct drm_gem_object *obj)
+{
+	/* Never mapped by the test. */
+	return (NULL);
+}
+
+static const struct drm_gem_object_funcs st_obj_funcs = {
+	.free = st_obj_free,
+	.illumos_umem = st_obj_umem,
+};
+
+static void
+st_drm_release(struct drm_device *dev)
+{
+	struct st_drm *st = container_of(dev, struct st_drm, drm);
+
+	if (st->obj != NULL)
+		drm_gem_object_put(st->obj);
+	st->obj = NULL;
+	pr_info("linuxkpi_selftest: DRM release ran, GEM object freed\n");
+}
+
+static const struct drm_driver st_drm_driver = {
+	.driver_features = DRIVER_GEM | DRIVER_RENDER,
+	.release = st_drm_release,
+	.name = "linuxkpi_selftest",
+	.desc = "LinuxKPI self-test",
+	.major = 1,
+	.minor = 0,
+	DRM_FACADE_DRIVER_VERSION,
+};
+
+static void
+test_drm_device(struct pci_dev *pdev)
+{
+	struct st_drm *st;
+	struct drm_gem_object *obj;
+
+	st = devm_drm_dev_alloc(&pdev->dev, &st_drm_driver, struct st_drm,
+	    drm);
+	CHECK("devm_drm_dev_alloc", !IS_ERR(st));
+	if (IS_ERR(st))
+		return;
+	obj = kzalloc(sizeof (*obj), GFP_KERNEL);
+	if (obj != NULL) {
+		obj->funcs = &st_obj_funcs;
+		CHECK("GEM object before drm_dev_register",
+		    drm_gem_private_object_init(&st->drm, obj, PAGE_SIZE) == 0 &&
+		    obj->dev == &st->drm);
+		st->obj = obj;
+	}
+	CHECK("drm_dev_register", drm_dev_register(&st->drm, 0) == 0 &&
+	    st->drm.primary != NULL && st->drm.primary->kdev == &pdev->dev);
+	st_drm_dev = st;
+}
+
 /* --- the driver ------------------------------------------------------------ */
 
 static int
@@ -402,6 +454,11 @@ st_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	test_idr_xarray();
 	test_slab();
 	test_dma(pdev);
+	test_drm_device(pdev);
+	/* The concurrency tests of the other selftest files (st.h). */
+	st_sched_tests();
+	st_mem_tests(pdev);
+	st_resv_tests();
 	pr_info("linuxkpi_selftest: done %d passed %d failed\n", st_passed,
 	    st_failed);
 	(void) ddi_prop_update_int(DDI_DEV_T_NONE, lkpi_dev_dip(&pdev->dev),
@@ -412,7 +469,10 @@ st_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 static void
 st_remove(struct pci_dev *pdev)
 {
-	(void) pdev;
+	/* As i915_driver_remove(): unplug; the devres put does the rest. */
+	if (st_drm_dev != NULL)
+		drm_dev_unplug(&st_drm_dev->drm);
+	st_drm_dev = NULL;
 }
 
 static const struct pci_device_id st_ids[] = {
@@ -439,37 +499,12 @@ st_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	return (lkpi_pci_detach(dip, cmd, &st_pci_driver));
 }
 
-/* No minor nodes: nothing to translate. */
-static int
-st_getinfo(dev_info_t *dip, ddi_info_cmd_t cmd, void *arg, void **result)
-{
-	return (DDI_FAILURE);
-}
-
-static struct cb_ops st_cb_ops = {
-	.cb_open = nulldev,
-	.cb_close = nulldev,
-	.cb_strategy = nodev,
-	.cb_print = nodev,
-	.cb_dump = nodev,
-	.cb_read = nodev,
-	.cb_write = nodev,
-	.cb_ioctl = nodev,
-	.cb_devmap = nodev,
-	.cb_mmap = nodev,
-	.cb_segmap = nodev,
-	.cb_chpoll = nochpoll,
-	.cb_prop_op = ddi_prop_op,
-	.cb_str = NULL,
-	.cb_flag = D_NEW | D_MP,
-	.cb_rev = CB_REV,
-	.cb_aread = nodev,
-	.cb_awrite = nodev
-};
+/* The DRM core's character entry points (the device's nodes). */
+static struct cb_ops st_cb_ops = DRM_CB_OPS;
 
 static struct dev_ops st_dev_ops = {
 	.devo_rev = DEVO_REV,
-	.devo_getinfo = st_getinfo,
+	.devo_getinfo = drm_getinfo,
 	.devo_identify = nulldev,
 	.devo_probe = nulldev,
 	.devo_attach = st_attach,
@@ -495,12 +530,16 @@ _init(void)
 {
 	int ret;
 
+	if ((ret = drm_facade_check("linuxkpi_selftest")) != 0)
+		return (ret);
 	if ((ret = linuxkpi_check("linuxkpi_selftest", LINUXKPI_ABI)) != 0)
 		return (ret);
 	if ((ret = pci_register_driver(&st_pci_driver)) != 0)
 		return (EINVAL);
-	if ((ret = mod_install(&st_modlinkage)) != 0)
+	if ((ret = mod_install(&st_modlinkage)) != 0) {
 		pci_unregister_driver(&st_pci_driver);
+		lkpi_module_quiesce(&st_modlinkage);
+	}
 	return (ret);
 }
 
@@ -512,6 +551,7 @@ _fini(void)
 	if ((ret = mod_remove(&st_modlinkage)) != 0)
 		return (ret);
 	pci_unregister_driver(&st_pci_driver);
+	lkpi_module_quiesce(&st_modlinkage);
 	return (0);
 }
 

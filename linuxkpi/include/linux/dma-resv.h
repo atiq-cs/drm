@@ -5,13 +5,14 @@
  * Linux's reservation objects: the DRM facade's (<drm/dma_resv.h>,
  * misc/drm_core; dma_resv_init/fini/trylock are the facade's since 1.1)
  * plus the Linux helpers built on them in the layer (src/lkpi_resv.c):
- * iterators over snapshots of the fences (drm_illumos_resv_fences(), one
- * per usage level so each fence reports its usage), dma_resv_get_fences(),
+ * iterators over one snapshot of the fences per walk
+ * (drm_illumos_resv_fences(): each fence once, with its usage; locked
+ * walks see signalled fences too), dma_resv_get_fences(),
  * dma_resv_get_singleton() (a fence array for several), wound/wait
  * transactions over the core's (drm_illumos_resv_lock_ctx()), and
- * dma_resv_held(). The fence lists themselves are the core's; the
- * iterators see the core's views of the fences (new structures, so a
- * driver's own fences come back as foreign ones).
+ * dma_resv_held(). The fence lists themselves are the core's; a fence a
+ * driver made comes back as that driver's own structure while it lives
+ * (i915 recognises its requests), other fences as the core's structures.
  */
 #ifndef _LINUX_DMA_RESV_H
 #define	_LINUX_DMA_RESV_H
@@ -44,6 +45,14 @@ struct dma_resv_iter {
 	bool is_restarted;
 	bool locked;
 	u8 *lkpi_usages;
+	/*
+	 * illumos: the snapshot the walk runs on. A locked walk
+	 * (dma_resv_for_each_fence()) releases it at its end or when the
+	 * object is unlocked, so it needs no dma_resv_iter_end(), as on Linux;
+	 * do not call dma_resv_iter_end() on a locked walk after the unlock.
+	 * An unlocked walk ends with dma_resv_iter_end().
+	 */
+	void *lkpi_snap;
 };
 
 extern struct dma_fence *dma_resv_iter_first_unlocked(

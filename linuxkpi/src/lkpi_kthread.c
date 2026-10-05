@@ -19,6 +19,7 @@
 #include <linux/list.h>
 #include <linux/sprintf.h>
 #include <linux/string.h>
+#include <linux/ctype.h>
 #include <linux/bug.h>
 #include "lkpi_internal.h"
 
@@ -77,6 +78,7 @@ struct task_struct *
 lkpi_kthread_create(int (*fn)(void *data), void *data, const char *namefmt,
     ...)
 {
+	char tqname[TASKQ_NAMELEN + 1];
 	struct lkpi_kthread *kt;
 	char name[32];
 	va_list ap;
@@ -96,7 +98,8 @@ lkpi_kthread_create(int (*fn)(void *data), void *data, const char *namefmt,
 	(mutex_init)(&kt->lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&kt->cv, NULL, CV_DRIVER, NULL);
 
-	kt->tq = ddi_taskq_create(NULL, name, 1, TASKQ_DEFAULTPRI, 0);
+	lkpi_taskq_name(tqname, sizeof (tqname), name);
+	kt->tq = ddi_taskq_create(NULL, tqname, 1, TASKQ_DEFAULTPRI, 0);
 	if (kt->tq == NULL) {
 		lkpi_kthread_free(kt);
 		return (ERR_PTR(-ENOMEM));
@@ -195,3 +198,61 @@ lkpi_kthread_fini(void)
 	}
 	mutex_exit(&lkpi_kthread_lock);
 }
+
+/*
+ * Stops the kthreads whose function lies in [lo, hi), the text of a
+ * driver that is unloading (lkpi_module_quiesce()). One still running is
+ * a driver bug and is reported; kthread_stop() waits for it to return.
+ * Returns how many were stopped.
+ */
+int
+lkpi_kthread_quiesce(uintptr_t lo, uintptr_t hi)
+{
+	struct lkpi_kthread *kt, *found;
+	boolean_t exited;
+	int n = 0;
+
+	for (;;) {
+		found = NULL;
+		mutex_enter(&lkpi_kthread_lock);
+		list_for_each_entry(kt, &lkpi_kthreads, link) {
+			if ((uintptr_t)kt->fn >= lo && (uintptr_t)kt->fn < hi) {
+				found = kt;
+				break;
+			}
+		}
+		mutex_exit(&lkpi_kthread_lock);
+		if (found == NULL)
+			return (n);
+		mutex_enter(&found->lock);
+		exited = found->exited;
+		mutex_exit(&found->lock);
+		if (!exited)
+			cmn_err(CE_WARN, "linuxkpi: kthread \"%s\" still "
+			    "running at driver unload, stopping it",
+			    found->task.comm);
+		(void) kthread_stop(&found->task);
+		n++;
+	}
+}
+
+static volatile uint32_t lkpi_taskq_seq;
+
+void
+lkpi_taskq_name(char *buf, size_t len, const char *base)
+{
+	char suffix[12];
+	size_t i, n;
+
+	(void) snprintf(suffix, sizeof (suffix), "_%u",
+	    atomic_inc_32_nv(&lkpi_taskq_seq));
+	n = len - 1 - strlen(suffix);
+	for (i = 0; i < n && base != NULL && base[i] != '\0'; i++) {
+		char c = base[i];
+
+		buf[i] = (isalnum(c) || c == '_' || c == '-' || c == '.') ?
+		    c : '_';
+	}
+	(void) strlcpy(buf + i, suffix, len - i);
+}
+
