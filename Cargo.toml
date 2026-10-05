@@ -32,22 +32,12 @@ drm-uapi = { path = "crates/drm-uapi" }
 drm-core = { path = "crates/drm-core", default-features = false }
 drm-facade = { path = "crates/drm-facade" }
 drm-facade-sys = { path = "crates/drm-facade-sys" }
-# illumos-ddi at the head of its g7-module-busy branch (stacked on
-# r5a-char-table, which is stacked on g1-gate-pin, which is stacked on
-# r4-virtio): clone opens, the
-# devmap(9E) entry point, OwnNode, chpoll(9E), the private tier for
-# dma-bufs, sync objects and sync files, PollBox, the virtio framework
-# (feature unstable-gate-cda5b9a49f-virtio) as pinned and checked at
-# illumos 7e802e88a3, and for R5a the CharTable glue with which misc/drm_core
-# serves the character devices other driver modules attach, the cb_ops:
-# form of module!, Driver::load, FileRef::char_dev,
-# TaskQueue::without_node, IntrPriority::new, current_context,
-# servicing_interrupt and module_loaded (for G7: a module only in memory
-# after a failed _init does not count). Move
-# the pin to the merge commit on illumos-ddi main once those branches are
-# merged.
-ddi-sys = { git = "https://code.aopc.cloud/illumos/illumos-ddi.git", rev = "6e65077fb18ae0a86daee6a43af8b361da9e59ff" }
-ddi = { git = "https://code.aopc.cloud/illumos/illumos-ddi.git", rev = "6e65077fb18ae0a86daee6a43af8b361da9e59ff", default-features = false }
+# illumos-ddi at the head of its graphics-dev branch: main with the
+# stacked branches r3-kms-glue, r2-private-fd, r4-virtio, g1-gate-pin,
+# r5a-char-table and g7-module-busy merged. Every illumos-ddi revision the
+# illumos-drm topic branches pin is an ancestor of this commit.
+ddi-sys = { git = "https://code.aopc.cloud/illumos/illumos-ddi.git", rev = "41aaab44ff8b54cf9e021e8764f0bbaad705e7b1" }
+ddi = { git = "https://code.aopc.cloud/illumos/illumos-ddi.git", rev = "41aaab44ff8b54cf9e021e8764f0bbaad705e7b1", default-features = false }
 serde_json = "1"
 
 # Kernel modules are linked by `ld -ztype=kmod`, not by rustc. Keep debug
