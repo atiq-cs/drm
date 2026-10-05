@@ -198,6 +198,10 @@ extern int pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
     resource_size_t (*alignf)(void *, const struct resource *,
     resource_size_t, resource_size_t), void *alignf_data);
 extern void pci_assign_unassigned_bus_resources(struct pci_bus *bus);
+extern resource_size_t pcibios_align_resource(void *data,
+    const struct resource *res, resource_size_t size, resource_size_t align);
+#define	PCIBIOS_MIN_MEM		0x10000000UL
+#define	PCIBIOS_MIN_IO		0x1000UL
 extern int pci_resize_resource(struct pci_dev *dev, int i, int size);
 extern int pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar);
 
@@ -210,12 +214,33 @@ extern int pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar);
 #define	pci_map_rom(p, s)		((void __iomem *)NULL)
 #define	pci_unmap_rom(p, r)		((void)(r))
 #define	pci_upstream_bridge(p)		((struct pci_dev *)NULL)
+#define	pcie_find_root_port(p)		((struct pci_dev *)NULL)
 #define	pci_physfn(p)			(p)
 #define	pci_num_vf(p)			0
 #define	pci_sriov_get_totalvfs(p)	0
 #define	pci_vfs_assigned(p)		0
 #define	pcie_get_speed_cap(p)		0
 #define	pcie_get_width_cap(p)		0
+
+/*
+ * The illumos side of a Linux PCI driver: the driver's attach(9E) and
+ * detach(9E) call these with its struct pci_driver. Attach builds the
+ * struct pci_dev of the node, matches the ID table and calls probe();
+ * detach calls remove() and releases the device's managed resources.
+ * DDI_SUSPEND/DDI_RESUME are refused (DDI_FAILURE).
+ */
+extern int lkpi_pci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd,
+    struct pci_driver *drv);
+extern int lkpi_pci_detach(dev_info_t *dip, ddi_detach_cmd_t cmd,
+    struct pci_driver *drv);
+extern struct pci_dev *lkpi_pci_dev_of(dev_info_t *dip);
+
+/*
+ * The driver registered with pci_register_driver() under the Linux name
+ * (drv->name), or NULL: the illumos glue of a driver whose struct
+ * pci_driver is static (i915) finds it here for lkpi_pci_attach().
+ */
+extern struct pci_driver *lkpi_pci_driver_lookup(const char *name);
 
 #define	module_pci_driver(drv) \
 	int lkpi_module_init_pci(void) { return (pci_register_driver(&(drv))); } \

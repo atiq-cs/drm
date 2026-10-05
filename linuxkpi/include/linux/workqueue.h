@@ -14,8 +14,12 @@
  * item may requeue itself. flush_work() waits until the item is neither
  * pending nor running; flush_workqueue() and drain_workqueue() wait until
  * the queue is idle. Delayed work arms a layer timer that queues the item.
- * system_wq, system_highpri_wq, system_long_wq, system_unbound_wq and
- * system_freezable_wq are created when misc/linuxkpi loads.
+ * system_wq, system_highpri_wq, system_long_wq, system_unbound_wq,
+ * system_freezable_wq, system_power_efficient_wq and
+ * system_freezable_power_efficient_wq are created when misc/linuxkpi
+ * loads; system_percpu_wq and system_dfl_wq (Linux's newer names) are
+ * system_wq and system_unbound_wq. Flushing a queue from one of its own
+ * items, or an item from itself, warns instead of deadlocking.
  */
 #ifndef _LINUX_WORKQUEUE_H
 #define	_LINUX_WORKQUEUE_H
@@ -25,6 +29,9 @@
 #include <linux/atomic.h>
 #include <linux/timer.h>
 #include <linux/workqueue_types.h>
+#include <linux/completion.h>
+#include <linux/rcupdate.h>
+#include <linux/cpumask.h>
 
 #define	WORK_STRUCT_PENDING_BIT	0
 #define	WORK_STRUCT_RUNNING_BIT	1

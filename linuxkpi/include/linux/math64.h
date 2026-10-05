@@ -81,18 +81,50 @@ mul_u64_u64_shr(u64 a, u64 mul, unsigned int shift)
 	return ((u64)(((unsigned __int128)a * mul) >> shift));
 }
 
+/*
+ * 128-by-64-bit division with the divq instruction (no libgcc
+ * __udivti3): the quotient must fit 64 bits, which holds for the
+ * callers' (a * mul / div) scaling with div >= mul; otherwise divq would
+ * fault, so larger quotients saturate to U64_MAX.
+ */
+static inline u64
+lkpi_div128_64(unsigned __int128 n, u64 d)
+{
+	u64 hi = (u64)(n >> 64), lo = (u64)n, q, r;
+
+	if (d == 0 || hi >= d)
+		return (~0ULL);
+	__asm__ ("divq %4" : "=a" (q), "=d" (r) : "a" (lo), "d" (hi), "rm" (d));
+	(void) r;
+	return (q);
+}
+
 static inline u64
 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)
 {
-	return ((u64)(((unsigned __int128)a * mul) / divisor));
+	return (lkpi_div128_64((unsigned __int128)a * mul, divisor));
 }
 
 static inline u64
 mul_u64_u64_div_u64(u64 a, u64 mul, u64 div)
 {
-	return ((u64)(((unsigned __int128)a * mul) / div));
+	return (lkpi_div128_64((unsigned __int128)a * mul, div));
 }
 
+#ifndef	DIV_ROUND_CLOSEST_ULL
+#define	DIV_ROUND_CLOSEST_ULL(x, divisor) ({ \
+	typeof (divisor) __d = divisor; \
+	unsigned long long _tmp = (x) + (__d) / 2; \
+	(void)do_div(_tmp, __d); _tmp; })
+#endif
+#ifndef	DIV_ROUND_CLOSEST
+#define	DIV_ROUND_CLOSEST(x, divisor) ({ \
+	typeof (x) __x = (x); typeof (divisor) __d = (divisor); \
+	(((typeof (x))-1) > 0 || ((typeof (divisor))-1) > 0 || \
+	(((__x) > 0) == ((__d) > 0))) ? \
+	(((__x) + ((__d) / 2)) / (__d)) : \
+	(((__x) - ((__d) / 2)) / (__d)); })
+#endif
 #define	DIV64_U64_ROUND_UP(ll, d) ({ u64 _d = (d); div64_u64((ll) + _d - 1, _d); })
 #define	DIV64_U64_ROUND_CLOSEST(dividend, divisor) ({ u64 _d = (divisor); \
 	div64_u64((dividend) + _d / 2, _d); })

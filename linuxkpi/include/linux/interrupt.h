@@ -14,12 +14,17 @@
  * synchronize_irq() waits for a running handler; disable_irq() disables
  * the vector and waits. Threaded handlers run the thread function from
  * the interrupt (no separate thread). Tasklets run on a layer worker
- * thread (thread context), one at a time per tasklet, as on Linux.
+ * thread (thread context, src/lkpi_work.c), one at a time per tasklet, as
+ * on Linux; a tasklet scheduled while disabled runs after tasklet_enable()
+ * (or, if enabled behind the layer's back, at the next one-tick poll).
  */
 #ifndef _LINUX_INTERRUPT_H
 #define	_LINUX_INTERRUPT_H
 
 #include <linux/types.h>
+#include <linux/bitops.h>
+#include <linux/irqflags.h>
+#include <linux/preempt.h>
 #include <linux/irqreturn.h>
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
@@ -94,12 +99,6 @@ extern bool tasklet_trylock(struct tasklet_struct *t);
 extern void tasklet_unlock(struct tasklet_struct *t);
 
 #define	tasklet_hi_schedule(t)		tasklet_schedule(t)
-
-static inline bool
-tasklet_is_locked(struct tasklet_struct *t)
-{
-	return (test_bit(TASKLET_STATE_RUN, &t->state));
-}
 
 static inline void
 tasklet_disable_nosync(struct tasklet_struct *t)

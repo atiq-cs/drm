@@ -16,6 +16,8 @@
 
 #define	X86_VENDOR_INTEL	0
 #define	X86_VENDOR_AMD		2
+#define	X86_VENDOR_HYGON	9
+#define	X86_VENDOR_UNKNOWN	0xff
 #define	X86_VENDOR_ANY		0xfffe
 #define	X86_FAMILY_ANY		0
 #define	X86_MODEL_ANY		0
@@ -34,7 +36,7 @@ struct cpuinfo_x86 {
 	u8 x86_model;
 	u8 x86_stepping;
 	u32 x86_vfm;
-	int x86_clflush_size;
+	u16 x86_clflush_size;
 	int x86_cache_alignment;
 	u32 x86_capability_lkpi[4];
 };

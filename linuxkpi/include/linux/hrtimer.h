@@ -15,6 +15,7 @@
 #include <linux/ktime.h>
 #include <linux/timer.h>
 #include <linux/rbtree.h>
+#include <linux/interrupt.h>
 
 enum hrtimer_mode {
 	HRTIMER_MODE_ABS = 0x00,
@@ -35,6 +36,10 @@ enum hrtimer_restart {
 	HRTIMER_RESTART
 };
 
+/* Linux's clock IDs (illumos' <sys/time.h> numbers its own differently). */
+#undef	CLOCK_REALTIME
+#undef	CLOCK_MONOTONIC
+#undef	CLOCK_BOOTTIME
 #define	CLOCK_REALTIME		0
 #define	CLOCK_MONOTONIC		1
 #define	CLOCK_BOOTTIME		7

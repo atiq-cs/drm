@@ -11,10 +11,15 @@
  * interrupt handler `current` is a shared placeholder that cannot sleep.
  * The task holds the sleep state of the set_current_state() /
  * schedule_timeout() / wake_up_process() protocol, a mutex and a
- * condition variable. TASK_INTERRUPTIBLE sleeps end early on a signal
- * (cv_reltimedwait_sig(9F)); signal_pending() then reports it until the
- * task's next interruptible sleep. Other task fields are fixed: comm is
- * "illumos", mm is NULL (no Linux address spaces), flags 0.
+ * condition variable. TASK_INTERRUPTIBLE and TASK_KILLABLE sleeps end
+ * early on any signal (cv_reltimedwait_sig(9F); illumos does not tell
+ * fatal signals apart) and set the task's sigpending flag.
+ * signal_pending() is false while the flag is clear; when it is set, it
+ * asks illumos again (a zero-length cv_reltimedwait_sig(), which does not
+ * sleep), so a flag left from an earlier system call cannot fail a later
+ * one. Other task fields are fixed: comm is "illumos" (a kthread's name
+ * for kthreads), mm is NULL (no Linux address spaces), pid is the
+ * process ID (ddi_get_pid(9F); 0 for kernel threads).
  */
 #ifndef _LINUX_SCHED_H
 #define	_LINUX_SCHED_H
@@ -25,6 +30,7 @@
 #include <linux/preempt.h>
 #include <linux/smp.h>
 #include <linux/sched/clock.h>
+#include <linux/capability.h>
 
 #define	TASK_RUNNING		0x00000000
 #define	TASK_INTERRUPTIBLE	0x00000001
@@ -39,6 +45,7 @@
 #define	TASK_NEW		0x00000800
 #define	TASK_KILLABLE		(TASK_WAKEKILL | TASK_UNINTERRUPTIBLE)
 #define	TASK_IDLE		(TASK_UNINTERRUPTIBLE | TASK_NOLOAD)
+#undef	TASK_NORMAL	/* <sys/task.h>: a task flag of illumos' own */
 #define	TASK_NORMAL		(TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)
 #define	TASK_COMM_LEN		16
 #define	PF_KTHREAD		0x00200000
@@ -77,8 +84,8 @@ extern int wake_up_state(struct task_struct *t, unsigned int state);
 #define	__set_current_state(s)		lkpi_set_current_state(s)
 #define	set_special_state(s)		lkpi_set_current_state(s)
 #define	task_is_running(t)		(READ_ONCE((t)->__state) == TASK_RUNNING)
-#define	schedule()		((void)schedule_timeout(MAX_SCHEDULE_TIMEOUT))
-#define	io_schedule()		schedule()
+extern void schedule(void);
+extern void io_schedule(void);
 #define	io_schedule_timeout(t)	schedule_timeout(t)
 #define	schedule_timeout_interruptible(t) \
 	({ set_current_state(TASK_INTERRUPTIBLE); schedule_timeout(t); })
@@ -97,16 +104,21 @@ extern void lkpi_cond_resched(void);
 #define	yield()				lkpi_cond_resched()
 #define	cpu_relax_yield()		lkpi_cond_resched()
 
+/* Whether t's signal is still pending (src/lkpi_sched.c). */
+extern int lkpi_signal_recheck(struct task_struct *t);
+
 static inline int
 signal_pending(struct task_struct *t)
 {
-	return (t->sigpending);
+	if (t->sigpending == 0)
+		return (0);
+	return (lkpi_signal_recheck(t));
 }
 
 static inline int
 fatal_signal_pending(struct task_struct *t)
 {
-	return (t->sigpending);
+	return (signal_pending(t));
 }
 
 static inline int
@@ -126,7 +138,23 @@ task_pid_nr(struct task_struct *t)
 #define	task_pid_vnr(t)		task_pid_nr(t)
 #define	task_tgid_nr(t)		task_pid_nr(t)
 #define	task_tgid_vnr(t)	task_pid_nr(t)
-#define	task_pid(t)		((struct pid *)(uintptr_t)(t)->pid)
+/*
+ * struct pid (struct lx_pid; illumos has its own): a reference-counted
+ * process ID, created by get_task_pid() (src/lkpi_sched.c).
+ */
+struct lx_pid;
+enum pid_type {
+	PIDTYPE_PID,
+	PIDTYPE_TGID,
+	PIDTYPE_PGID,
+	PIDTYPE_SID,
+	PIDTYPE_MAX
+};
+extern struct lx_pid *get_task_pid(struct task_struct *task, enum pid_type type);
+extern struct lx_pid *get_pid(struct lx_pid *pid);
+extern void put_pid(struct lx_pid *pid);
+extern pid_t pid_nr(struct lx_pid *pid);
+#define	pid_vnr(p)		pid_nr(p)
 #define	get_task_comm(buf, t)	strscpy(buf, (t)->comm, sizeof (buf))
 #define	__get_task_comm(buf, n, t)	strscpy(buf, (t)->comm, n)
 #define	set_user_nice(t, n)	((void)(t), (void)(n))
