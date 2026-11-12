@@ -20,8 +20,13 @@ SYSINC=${SYSINC:-/usr/include}
 DDI_MAPFILE=${DDI_MAPFILE:-$CODEMGR_WS/target/ddi.mapfile}
 CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$CODEMGR_WS/target}
 PKGREPO=${PKGREPO:-$CODEMGR_WS/packages/i386/nightly/repo.redist}
+# Empty/unset PKG_SERIAL preserves the manifests' versions (serial 0 today).
+# Set a decimal serial to version all seven packages and in-stack dependencies.
+# PKG_PUBLISHER selects both their publisher and the repository's prefix.
+PKG_SERIAL=${PKG_SERIAL-}
+PKG_PUBLISHER=${PKG_PUBLISHER:-illumos-drm}
 export CODEMGR_WS ROOT DMAKE_MAX_JOBS CARGO_BUILD_JOBS CC LD CARGO
 export RUST_TOOLCHAIN CARGO_FLAGS CTFCONVERT SYSINC DDI_MAPFILE
-export CARGO_TARGET_DIR PKGREPO
+export CARGO_TARGET_DIR PKGREPO PKG_SERIAL PKG_PUBLISHER
 LC_ALL=C
 export LC_ALL

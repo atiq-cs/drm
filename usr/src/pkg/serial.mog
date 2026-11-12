@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MPL-2.0
+# Keep every package and its in-stack require/incorporate dependencies together.
+<transform set name=pkg.fmri -> edit value ,5[.]11-2026[.]0[.]0[.][0-9]+$ ,5.11-2026.0.0.$(PKG_SERIAL)>
+<transform depend type=(require|incorporate) fmri=(pkg:/|pkg://[^/]+/)?driver/graphics/(drm-core|drm-helpers|drm-kms|linuxkpi|i915n|virtio-gpu|drmadm)@ -> edit fmri @([^,]+)(,.*)?$ '@\1,5.11-2026.0.0.$(PKG_SERIAL)'>
