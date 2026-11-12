@@ -2600,6 +2600,21 @@ vendored crates, set `CARGO=/usr/bin/cargo RUSTC=/usr/bin/rustc`,
 `RUST_TOOLCHAIN=system RUSTC_BOOTSTRAP=1 CARGO_FLAGS=--frozen` before sourcing
 `myenv.sh`; otherwise it selects `nightly-2026-04-16` through rustup.
 
+`PKG_SERIAL` is empty by default, preserving the manifests' versions (build
+serial `0` today) and dependency actions. Set it to a decimal serial to publish
+all seven packages and their in-stack require/incorporate dependencies with
+that build serial. `PKG_PUBLISHER` defaults to `illumos-drm` and selects both
+the package publisher and the local repository's publisher prefix. For example,
+after staging with `install`:
+
+```sh
+PKG_SERIAL=2026111301 PKG_PUBLISHER=illumos-drm-test \
+    PKGREPO="$PWD/packages/test/repo" /usr/bin/dmake package
+```
+
+Packaging uses `pkgmogrify` and keeps the generated manifests beside the
+repository in `${PKGREPO}.manifests`; committed manifests are unchanged.
+
 C compiler and linker flags come from sourced module fragments shared with
 the independent build scripts. Setup writes make variable includes; run
 `dmake setup` again after changing the compiler or header configuration.
