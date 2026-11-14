@@ -138,6 +138,75 @@ gem_objects(const char *drv)
 	return (v);
 }
 
+/* These probes run on one thread, with the next descriptor below this bound. */
+#define	FD_SCAN_LIMIT	4096
+
+static int
+fd_count(void)
+{
+	int fd, n = 0;
+
+	for (fd = 0; fd < FD_SCAN_LIMIT; fd++) {
+		if (fcntl(fd, F_GETFD) != -1)
+			n++;
+		else if (errno != EBADF)
+			return (-1);
+	}
+	return (n);
+}
+
+static int
+next_fd(void)
+{
+	int fd = open("/dev/null", O_RDONLY);
+
+	if (fd < 0 || close(fd) != 0)
+		return (-1);
+	return (fd);
+}
+
+/* Copy-in works, but the driver's final argument copy-out must fail. */
+static int
+copyout_fault(struct dev *d, unsigned long req, const void *arg, size_t size)
+{
+	long pagesize = sysconf(_SC_PAGESIZE);
+	uint64_t objects = gem_objects(d->name);
+	int before = fd_count(), next = next_fd(), r, error;
+	void *page;
+
+	check(before >= 0 && next >= 0 && next < FD_SCAN_LIMIT,
+	    "copy-out fault: descriptor baseline and reusable number");
+	check(objects != UINT64_MAX, "copy-out fault: read live GEM count");
+	check(pagesize > 0 && size <= (size_t)pagesize,
+	    "copy-out fault: argument fits in one page");
+	if (pagesize <= 0 || size > (size_t)pagesize)
+		return (before);
+	page = mmap(NULL, (size_t)pagesize, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	check(page != MAP_FAILED, "copy-out fault: map anonymous argument page");
+	if (page == MAP_FAILED)
+		return (before);
+	(void) memcpy(page, arg, size);
+	r = mprotect(page, (size_t)pagesize, PROT_READ);
+	check(r == 0, "copy-out fault: make the argument read-only");
+	if (r == 0) {
+		errno = 0;
+		r = ioctl(d->fd, req, page);
+		error = errno;
+		check(r == -1 && error == EFAULT,
+		    "read-only argument: ioctl returns -1 with EFAULT");
+		check(before >= 0 && fd_count() == before,
+		    "failed copy-out leaves no open descriptor");
+		check(next >= 0 && next_fd() == next,
+		    "failed copy-out gives the reserved descriptor number back");
+		check(objects != UINT64_MAX && gem_objects(d->name) == objects,
+		    "failed copy-out leaves the live GEM count unchanged");
+	}
+	check(munmap(page, (size_t)pagesize) == 0,
+	    "copy-out fault: unmap the argument page");
+	return (before);
+}
+
 /* A buffer of `a`, shared with `b` through a dma-buf. */
 static void
 share(struct dev *a, struct dev *b)
@@ -222,12 +291,12 @@ static void
 selftest(struct dev *c, struct dev *o)
 {
 	char what[160];
-	uint64_t size;
+	uint64_t size, objects;
 	uint32_t pitch, ho, *po, *pc;
 	struct drm_prime_handle ph;
 	struct cdrmnull_prime_selftest st;
 	size_t i;
-	int ok;
+	int ok, before;
 
 	(void) printf("--- PRIME_SELFTEST with %s\n", o->name);
 	ho = dumb(o->fd, &size, &pitch);
@@ -265,7 +334,11 @@ selftest(struct dev *c, struct dev *o)
 	/* And back: cdrmnull exports its import with dma_buf_fd. */
 	st.fd = -1;
 	st.flags = CDRMNULL_PRIME_EXPORT;
-	check(xioctl(c->fd, DRM_IOCTL_CDRMNULL_PRIME_SELFTEST, &st) == 0 && st.fd >= 0,
+	(void) printf("--- cdrmnull PRIME_EXPORT copy-out fault\n");
+	objects = gem_objects(c->name);
+	before = copyout_fault(c, DRM_IOCTL_CDRMNULL_PRIME_SELFTEST, &st, sizeof (st));
+	check(xioctl(c->fd, DRM_IOCTL_CDRMNULL_PRIME_SELFTEST, &st) == 0 &&
+	    st.fd >= 0 && fcntl(st.fd, F_GETFD) != -1,
 	    "cdrmnull exports it again (drm_gem_prime_export, dma_buf_fd)");
 	if (st.fd >= 0) {
 		uint32_t *pd = mmap(NULL, size, PROT_READ, MAP_SHARED, st.fd, 0);
@@ -281,8 +354,12 @@ selftest(struct dev *c, struct dev *o)
 		check(xioctl(o->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) == 0 && ph.handle == ho, what);
 		if (ph.handle != 0 && ph.handle != ho)
 			gem_close(o->fd, ph.handle);
-		(void) close(st.fd);
+		check(close(st.fd) == 0, "close the writable PRIME_EXPORT descriptor");
 	}
+	check(before >= 0 && fd_count() == before,
+	    "writable PRIME_EXPORT returns the descriptor count to baseline");
+	check(objects != UINT64_MAX && gem_objects(c->name) == objects,
+	    "writable PRIME_EXPORT leaves the live GEM count unchanged");
 	gem_close(c->fd, st.handle);
 	(void) munmap((void *)po, size);
 	gem_close(o->fd, ho);
@@ -294,16 +371,20 @@ fences(struct dev *a, struct dev *b)
 {
 	char what[160];
 	struct cdrmnull_fence nf;
+	uint64_t objects;
 	uint32_t so = 0, first;
-	int r;
+	int r, before;
 
 	(void) printf("--- a fence of %s waited for by %s\n", a->name, b->name);
 	(void) memset(&nf, 0, sizeof (nf));
 	nf.delay_ms = 200;
 	nf.flags = CDRMNULL_FENCE_SYNC_FILE;
 	nf.fd = -1;
+	objects = gem_objects(a->name);
+	before = copyout_fault(a, RDRMNULL_IOCTL_FENCE, &nf, sizeof (nf));
 	(void) snprintf(what, sizeof (what), "%s: a 200 ms test fence as a sync file", a->name);
-	check(xioctl(a->fd, RDRMNULL_IOCTL_FENCE, &nf) == 0 && nf.fd >= 0, what);
+	check(xioctl(a->fd, RDRMNULL_IOCTL_FENCE, &nf) == 0 &&
+	    nf.fd >= 0 && fcntl(nf.fd, F_GETFD) != -1, what);
 	if (nf.fd < 0)
 		return;
 	r = drmSyncobjCreate(b->fd, 0, &so);
@@ -313,7 +394,11 @@ fences(struct dev *a, struct dev *b)
 	(void) snprintf(what, sizeof (what), "%s waits for %s's fence", b->name, a->name);
 	check(r == 0, what);
 	(void) drmSyncobjDestroy(b->fd, so);
-	(void) close(nf.fd);
+	check(close(nf.fd) == 0, "close the writable FENCE_SYNC_FILE descriptor");
+	check(before >= 0 && fd_count() == before,
+	    "writable FENCE_SYNC_FILE returns the descriptor count to baseline");
+	check(objects != UINT64_MAX && gem_objects(a->name) == objects,
+	    "writable FENCE_SYNC_FILE leaves the live GEM count unchanged");
 }
 
 /* cdrmnull's FENCE_SELFTEST: the facade's fence callbacks. */
