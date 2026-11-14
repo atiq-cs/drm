@@ -20,9 +20,9 @@
 //! inside, never around, these.
 
 use ddi::prelude::*;
-use ddi::private::fd::{FdFlags, FileRef};
+use ddi::private::fd::{FdFlags, FileRef, NewFd};
 
-use crate::anon_fd::{AnonFiles, AnonObj};
+use crate::anon_fd::{AnonFiles, AnonObj, install_written};
 use crate::defer::Ctx;
 use crate::fence::{Fence, FenceDomain};
 use crate::gem::{GemCore, GemObject, KIdSpace, NameBuf};
@@ -319,6 +319,22 @@ impl<O: GemObject> SyncCore<O> {
         write_fd: impl FnOnce(i32) -> Result<(), Errno>,
         ctx: &Sleepable,
     ) -> Result<(), Errno> {
+        install_written(self.sync_file_fd(fence, name, cloexec, arg, ctx)?, write_fd)
+    }
+
+    /// Makes a sync file of `fence` and opens it as a new descriptor of the
+    /// calling process, from inside an ioctl, reserved but not visible to
+    /// the process until it is installed; dropping it undoes everything
+    /// (the facade's `drm_sync_file_install`, which installs it after the
+    /// ioctl's copy-out).
+    pub fn sync_file_fd<'a>(
+        &self,
+        fence: Fence,
+        name: &[u8],
+        cloexec: bool,
+        arg: &'a IoctlArg<'_>,
+        ctx: &Sleepable,
+    ) -> Result<NewFd<'a>, Errno> {
         let sf = match SyncFile::new(fence.clone(), name, ctx) {
             Ok(sf) => sf,
             Err(e) => {
@@ -328,7 +344,7 @@ impl<O: GemObject> SyncCore<O> {
         };
         fence.put(Ctx::Sleep(ctx));
         let flags = FdFlags { write: false, cloexec };
-        self.anon.export(&self.dev, AnonObj::SyncFile(sf), flags, arg, write_fd, &self.domain.stats, ctx)
+        self.anon.open_fd(&self.dev, AnonObj::SyncFile(sf), flags, arg, &self.domain.stats, ctx)
     }
 
     /// Returns the fence of sync file descriptor `fd` of the calling

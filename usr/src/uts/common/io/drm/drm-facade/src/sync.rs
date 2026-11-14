@@ -70,6 +70,9 @@ impl Syncobj {
 
 /// Makes a sync file of `f` and returns a new descriptor of the calling
 /// process for it (close-on-exec with `cloexec`); inside an ioctl handler.
+/// The descriptor becomes visible to the process only if the ioctl returns
+/// success, after the core has copied the argument out; until then the
+/// number is reserved but not open.
 pub fn sync_file_export(f: &Fence, cloexec: bool) -> Result<i32, Errno> {
     let mut fd = -1;
     // SAFETY: a live fence, inside a handler.

@@ -31,7 +31,7 @@
 
 use ddi::IoctlArg;
 use ddi::prelude::*;
-use ddi::private::fd::FdFlags;
+use ddi::private::fd::{FdFlags, NewFd};
 use drm_uapi as uapi;
 
 use crate::Device;
@@ -158,22 +158,23 @@ impl<O: GemObject> SyncCore<O> {
         a.write(arg)
     }
 
-    /// Hands `obj`'s dma-buf to the calling process as a new descriptor,
+    /// Opens `obj`'s dma-buf as a new descriptor of the calling process,
     /// from inside an ioctl of this device (the facade's `dma_buf_fd`):
     /// the same dma-buf as `PRIME_HANDLE_TO_FD` makes, `write` for writable
-    /// mappings. `write_fd` receives the number before it becomes visible.
-    pub fn export_dmabuf(
+    /// mappings. The descriptor is reserved but not visible to the process
+    /// until it is installed, which the facade does after the ioctl's
+    /// copy-out; dropping it undoes the export.
+    pub fn dmabuf_fd<'a>(
         &self,
         obj: GemRef<O>,
         write: bool,
         cloexec: bool,
-        arg: &IoctlArg<'_>,
-        write_fd: impl FnOnce(i32) -> Result<(), Errno>,
+        arg: &'a IoctlArg<'_>,
         ctx: &Sleepable,
-    ) -> Result<(), Errno> {
+    ) -> Result<NewFd<'a>, Errno> {
         self.housekeeping(ctx);
         let fdf = FdFlags { write, cloexec };
-        let r = self.anon.export(&self.dev, AnonObj::DmaBuf(obj), fdf, arg, write_fd, &self.domain.stats, ctx);
+        let r = self.anon.open_fd(&self.dev, AnonObj::DmaBuf(obj), fdf, arg, &self.domain.stats, ctx);
         self.publish();
         r
     }

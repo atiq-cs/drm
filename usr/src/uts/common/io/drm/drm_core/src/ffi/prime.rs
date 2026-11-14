@@ -142,34 +142,24 @@ pub unsafe extern "C" fn dma_buf_fd(dmabuf: *mut f::dma_buf, flags: i32) -> i32 
     let flags = flags as u32;
     let write = flags & drm_core::prime::DRM_RDWR != 0;
     let cloexec = flags & drm_core::prime::DRM_CLOEXEC != 0;
-    let r = crate::ctxt::with_current(|_frame, arg| {
+    // Reserved now, installed by the facade driver after the ioctl's
+    // copy-out (EINVAL outside a driver ioctl).
+    let r = crate::ctxt::reserve_fd(|_frame, arg| {
         // The dma-buf file belongs to the exporting object's device.
         let core = h.obj.object().core();
         let d = core.device().ok_or(Errno::ENODEV)?;
-        let mut out = -1;
-        d.sync().export_dmabuf(
-            h.obj.clone(),
-            write,
-            cloexec,
-            arg,
-            |fd| {
-                out = fd;
-                Ok(())
-            },
-            &ctx,
-        )?;
-        Ok(out)
+        d.sync().dmabuf_fd(h.obj.clone(), write, cloexec, arg, &ctx)
     });
     match r {
-        Some(Ok(fd)) => {
+        Ok(fd) => {
             // As on Linux, the descriptor takes over the caller's
-            // reference (its file holds its own object reference).
+            // reference (its file holds its own object reference, which
+            // goes with the file if the ioctl fails after all).
             // SAFETY: the caller's reference, given up on success.
             unsafe { dma_buf_put(dmabuf) };
             fd
         }
-        Some(Err(e)) => neg(e),
-        None => neg(Errno::EINVAL),
+        Err(e) => neg(e),
     }
 }
 

@@ -985,6 +985,107 @@ sync_status(int sfd, uint32_t *nfences)
 	return (info.status);
 }
 
+/* Run before the threaded tests; also detect a reserved but unopened slot. */
+#define	FD_SCAN_LIMIT	4096
+
+static int
+fd_count(void)
+{
+	int fd, n = 0;
+
+	for (fd = 0; fd < FD_SCAN_LIMIT; fd++) {
+		if (fcntl(fd, F_GETFD) != -1)
+			n++;
+		else if (errno != EBADF)
+			return (-1);
+	}
+	return (n);
+}
+
+static int
+next_fd(void)
+{
+	int fd = open("/dev/null", O_RDONLY);
+
+	if (fd < 0 || close(fd) != 0)
+		return (-1);
+	return (fd);
+}
+
+static void
+test_fence_copyout(int fd)
+{
+	struct rdrmnull_fence input, *f;
+	const char *const gem_keys[] = { "objects" };
+	uint64_t sync_before[NLIVE], sync_after[NLIVE], gem_before, gem_after;
+	long pagesize = sysconf(_SC_PAGESIZE);
+	int before, next, r, error, ready;
+
+	ready = sync_idle(0) &&
+	    kstat_values("sync", sync_live_keys, sync_before, NLIVE) == 0 &&
+	    kstat_values("gem", gem_keys, &gem_before, 1) == 0 &&
+	    gem_before != UINT64_MAX;
+	check(ready, "fence copy-out: snapshot idle live sync and GEM counts");
+	check(pagesize > 0 && sizeof (input) <= (size_t)pagesize,
+	    "fence copy-out: argument fits in one page");
+	if (!ready || pagesize <= 0 || sizeof (input) > (size_t)pagesize)
+		return;
+	f = mmap(NULL, (size_t)pagesize, PROT_READ | PROT_WRITE,
+	    MAP_PRIVATE | MAP_ANON, -1, 0);
+	check(f != MAP_FAILED, "fence copy-out: map anonymous argument page");
+	if (f == MAP_FAILED)
+		return;
+	(void) memset(&input, 0, sizeof (input));
+	input.flags = FENCE_SYNC_FILE;
+	input.fd = -1;
+	(void) memcpy(f, &input, sizeof (input));
+	before = fd_count();
+	next = next_fd();
+	check(before >= 0 && next >= 0 && next < FD_SCAN_LIMIT,
+	    "fence copy-out: descriptor baseline and reusable number");
+	r = mprotect(f, (size_t)pagesize, PROT_READ);
+	check(r == 0, "fence copy-out: make the argument read-only");
+	if (r != 0) {
+		(void) munmap(f, (size_t)pagesize);
+		return;
+	}
+	errno = 0;
+	r = ioctl(fd, RDRMNULL_IOCTL_FENCE, f);
+	error = errno;
+	check(r == -1 && error == EFAULT,
+	    "read-only FENCE_SYNC_FILE returns -1 with EFAULT");
+	check(before >= 0 && fd_count() == before,
+	    "failed fence copy-out leaves no open descriptor");
+	check(next >= 0 && next_fd() == next,
+	    "failed fence copy-out gives the reserved descriptor number back");
+	check(sync_idle(0) &&
+	    kstat_values("sync", sync_live_keys, sync_after, NLIVE) == 0 &&
+	    memcmp(sync_before, sync_after, sizeof (sync_before)) == 0 &&
+	    kstat_values("gem", gem_keys, &gem_after, 1) == 0 &&
+	    gem_after == gem_before,
+	    "failed fence copy-out leaves live sync and GEM counts unchanged");
+	r = mprotect(f, (size_t)pagesize, PROT_READ | PROT_WRITE);
+	check(r == 0, "fence copy-out: restore a writable argument");
+	if (r == 0) {
+		(void) memcpy(f, &input, sizeof (input));
+		r = ioctl(fd, RDRMNULL_IOCTL_FENCE, f);
+		check(r == 0 && f->fd >= 0 && fcntl(f->fd, F_GETFD) != -1,
+		    "writable FENCE_SYNC_FILE returns an open descriptor");
+		if (r == 0 && f->fd >= 0)
+			check(close(f->fd) == 0, "close the writable fence descriptor");
+		check(before >= 0 && fd_count() == before,
+		    "writable fence returns the descriptor count to baseline");
+		check(sync_idle(0) &&
+		    kstat_values("sync", sync_live_keys, sync_after, NLIVE) == 0 &&
+		    memcmp(sync_before, sync_after, sizeof (sync_before)) == 0 &&
+		    kstat_values("gem", gem_keys, &gem_after, 1) == 0 &&
+		    gem_after == gem_before,
+		    "writable fence leaves live sync and GEM counts unchanged");
+	}
+	check(munmap(f, (size_t)pagesize) == 0,
+	    "fence copy-out: unmap the argument page");
+}
+
 static void
 test_sync_file(int fd)
 {
@@ -997,6 +1098,7 @@ test_sync_file(int fd)
 	struct drm_syncobj_handle sh;
 	int64_t t0;
 
+	test_fence_copyout(fd);
 	check(null_fence(fd, 300, FENCE_SYNC_FILE, 0, 0, 0, 0, &s1) == 0 &&
 	    s1 >= 0, "rdrmnull fence as a sync file (300 ms)");
 	check(is_cloexec(s1), "the sync file is close-on-exec");

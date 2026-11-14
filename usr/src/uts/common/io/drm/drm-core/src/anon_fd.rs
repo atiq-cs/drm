@@ -47,6 +47,25 @@
 //! Sync object files and sync files of one device can be imported into
 //! another device of the same driver (see `fence_dev::SyncCore::lookup`);
 //! dma-bufs cannot (`ENOTSUP`).
+//!
+//! # Descriptors of driver ioctls
+//!
+//! The core's own ioctls copy a new descriptor's number out to the caller
+//! before they make the descriptor visible, so an ioctl whose copy fails
+//! leaves no descriptor behind. A driver's handler (`dma_buf_fd`,
+//! `drm_sync_file_install`) gets the number while its argument is still
+//! the kernel's copy, which the facade driver copies out only after the
+//! handler has returned. Such descriptors are therefore only reserved
+//! ([`defer_fd`]) and kept in the ioctl's [`PendingFds`]; [`install_after`]
+//! installs them once the handler succeeded and the argument was copied
+//! out, and gives them up otherwise. This is the order of `pipe(2)`
+//! (`falloc`, `copyout`, `setf`). It is stricter than Linux, whose i915
+//! installs its out-fence inside the handler (`fd_install` in
+//! `i915_gem_do_execbuffer`). Closing an installed descriptor after a
+//! failed copy instead would race with the other threads of the process,
+//! which may already have used, duplicated or replaced it.
+
+use core::ptr::NonNull;
 
 use ddi::{Errno, Sleepable};
 
@@ -187,6 +206,99 @@ impl<V, A: IdAlloc> AnonTable<V, A> {
     }
 }
 
+/// A descriptor reserved in the calling process but not visible to it
+/// (`ddi::private::fd::NewFd`). Dropping it gives the descriptor up again,
+/// with its file and the object reference the file holds.
+pub trait ReservedFd {
+    /// Returns the descriptor number.
+    fn fd(&self) -> i32;
+
+    /// Makes the descriptor visible to the process, which owns it from
+    /// then on.
+    fn install(self);
+}
+
+/// The most descriptors one driver ioctl can ask for. The drivers ask for
+/// one at most (an out-fence or an exported buffer); a further request
+/// fails with `EMFILE`, as Linux's `get_unused_fd_flags` does when no
+/// descriptor is left.
+pub const MAX_PENDING_FDS: usize = 4;
+
+/// The descriptors a driver ioctl in progress asked for, in the order of
+/// the requests. Dropping the list gives them all up;
+/// [`PendingFds::commit`] installs them.
+pub struct PendingFds<F: ReservedFd> {
+    fds: [Option<F>; MAX_PENDING_FDS],
+}
+
+impl<F: ReservedFd> PendingFds<F> {
+    /// An empty list.
+    pub const fn new() -> PendingFds<F> {
+        PendingFds { fds: [const { None }; MAX_PENDING_FDS] }
+    }
+
+    /// Returns the number of descriptors asked for.
+    pub fn len(&self) -> usize {
+        self.fds.iter().filter(|f| f.is_some()).count()
+    }
+
+    /// Reports whether no descriptor was asked for.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Installs the descriptors, in the order they were asked for.
+    pub fn commit(mut self) {
+        for f in self.fds.iter_mut().filter_map(Option::take) {
+            f.install();
+        }
+    }
+}
+
+impl<F: ReservedFd> Default for PendingFds<F> {
+    fn default() -> PendingFds<F> {
+        PendingFds::new()
+    }
+}
+
+/// Asks for a descriptor for the driver ioctl whose list is `pending`:
+/// `open` reserves it, and its number is returned for the handler to put
+/// in the kernel copy of the argument. The descriptor becomes visible only
+/// when the list is committed. Without a list (outside a driver ioctl, or
+/// in one whose argument is not copied out through [`install_after`])
+/// `EINVAL`, and with a full list `EMFILE`; `open` is not called then, so
+/// nothing is ever installed at once.
+pub fn defer_fd<F: ReservedFd>(
+    pending: Option<&mut PendingFds<F>>,
+    open: impl FnOnce() -> Result<F, Errno>,
+) -> Result<i32, Errno> {
+    let p = pending.ok_or(Errno::EINVAL)?;
+    let slot = p.fds.iter_mut().find(|f| f.is_none()).ok_or(Errno::EMFILE)?;
+    let f = open()?;
+    let fd = f.fd();
+    *slot = Some(f);
+    Ok(fd)
+}
+
+/// Runs a driver ioctl: `handler` calls the driver with the kernel copy of
+/// the argument and the list recorded where [`defer_fd`] finds it, then
+/// `copy_out` copies the argument out to the caller. The descriptors the
+/// handler asked for are installed only if both succeed; on any error they
+/// are given up and the error is returned, so a failed ioctl leaves none
+/// behind.
+///
+/// `handler` must not use the list after it has returned.
+pub fn install_after<F: ReservedFd>(
+    handler: impl FnOnce(NonNull<PendingFds<F>>) -> Result<(), Errno>,
+    copy_out: impl FnOnce() -> Result<(), Errno>,
+) -> Result<(), Errno> {
+    let mut pending = PendingFds::new();
+    handler(NonNull::from(&mut pending))?;
+    copy_out()?;
+    pending.commit();
+    Ok(())
+}
+
 #[cfg(not(test))]
 pub(crate) use imp::*;
 
@@ -203,6 +315,28 @@ mod imp {
     use crate::ksync::KMutex;
     use crate::sync_file::SyncFile;
     use crate::syncobj::Syncobj;
+
+    impl super::ReservedFd for NewFd<'_> {
+        fn fd(&self) -> i32 {
+            NewFd::fd(self)
+        }
+
+        fn install(self) {
+            NewFd::install(self)
+        }
+    }
+
+    /// Copies the number of `nfd` out with `write_fd` and installs the
+    /// descriptor if that succeeded; drops it, which undoes the export,
+    /// otherwise.
+    pub(crate) fn install_written(
+        nfd: NewFd<'_>,
+        write_fd: impl FnOnce(i32) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        write_fd(nfd.fd())?;
+        nfd.install();
+        Ok(())
+    }
 
     /// What an anonymous file stands for.
     pub(crate) enum AnonObj<O: GemObject> {
@@ -271,6 +405,24 @@ mod imp {
             stats: &SyncStats,
             ctx: &Sleepable,
         ) -> Result<(), Errno> {
+            install_written(self.open_fd(dev, obj, flags, arg, stats, ctx)?, write_fd)
+        }
+
+        /// Opens `obj` as a new file with `flags` and reserves a descriptor
+        /// for it in the calling process, not visible to the process until
+        /// it is installed; dropping it undoes everything, the file's
+        /// object reference included. The first half of
+        /// [`AnonFiles::export`], for descriptors that a driver's handler
+        /// asks for and the facade driver installs after its copy-out.
+        pub(crate) fn open_fd<'a>(
+            &self,
+            dev: &DevInfo,
+            obj: AnonObj<O>,
+            flags: FdFlags,
+            arg: &'a IoctlArg<'_>,
+            stats: &SyncStats,
+            ctx: &Sleepable,
+        ) -> Result<NewFd<'a>, Errno> {
             // A dma-buf reuses its object's open minor (booked, so a racing
             // last close keeps it); anything else gets a new one.
             let (id, _fresh, spare) = match self.reserve(obj, true, stats, ctx) {
@@ -289,10 +441,7 @@ mod imp {
             if let Some(lo) = leftover {
                 self.dropped(id, lo, stats, ctx);
             }
-            let nfd = r?;
-            write_fd(nfd.fd())?;
-            nfd.install();
-            Ok(())
+            r
         }
 
         /// Finds or creates the entry for `obj` and books one open. Returns
@@ -406,7 +555,10 @@ mod tests {
     use super::*;
     use crate::minor;
 
+    use crate::fence::{Fence, FenceDomain};
     use crate::idmap::FirstFit;
+    use crate::karc::KArc;
+    use core::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -570,5 +722,302 @@ mod tests {
         assert!(minor::bind(10, ddi::Instance(2)));
         assert_eq!(minor::instance_of_minor(ddi::Minor(m)), Some(ddi::Instance(2)));
         assert!(minor::unbind(10, ddi::Instance(2)));
+    }
+
+    /// One slot of a fake descriptor table.
+    enum Slot<T> {
+        Free,
+        /// Reserved by falloc, no file yet (uf_busy set, uf_file NULL).
+        Reserved,
+        /// Installed by setf; the file holds the object reference.
+        Open(T),
+    }
+
+    /// A process's descriptor table as falloc, setf and unfalloc leave it.
+    struct FakeTable<T> {
+        slots: RefCell<Vec<Slot<T>>>,
+    }
+
+    impl<T> FakeTable<T> {
+        fn new() -> FakeTable<T> {
+            FakeTable { slots: RefCell::new(Vec::new()) }
+        }
+
+        /// falloc: reserves the lowest free descriptor for a file that
+        /// holds `obj`.
+        fn reserve(&self, obj: T) -> FakeFd<'_, T> {
+            let mut s = self.slots.borrow_mut();
+            let fd = match s.iter().position(|x| matches!(x, Slot::Free)) {
+                Some(i) => i,
+                None => {
+                    s.push(Slot::Free);
+                    s.len() - 1
+                }
+            };
+            s[fd] = Slot::Reserved;
+            FakeFd { table: self, fd: fd as i32, obj: Some(obj) }
+        }
+
+        fn state(&self, fd: i32) -> &'static str {
+            match self.slots.borrow().get(fd as usize) {
+                None | Some(Slot::Free) => "free",
+                Some(Slot::Reserved) => "reserved",
+                Some(Slot::Open(_)) => "open",
+            }
+        }
+
+        fn all_free(&self) -> bool {
+            self.slots.borrow().iter().all(|x| matches!(x, Slot::Free))
+        }
+
+        /// close(2) of an installed descriptor: returns the file's object
+        /// reference.
+        fn close(&self, fd: i32) -> Option<T> {
+            let mut s = self.slots.borrow_mut();
+            match core::mem::replace(&mut s[fd as usize], Slot::Free) {
+                Slot::Open(o) => Some(o),
+                other => {
+                    s[fd as usize] = other;
+                    None
+                }
+            }
+        }
+    }
+
+    /// A reserved descriptor of a FakeTable, as NewFd is one of the
+    /// process.
+    struct FakeFd<'t, T> {
+        table: &'t FakeTable<T>,
+        fd: i32,
+        obj: Option<T>,
+    }
+
+    impl<T> ReservedFd for FakeFd<'_, T> {
+        fn fd(&self) -> i32 {
+            self.fd
+        }
+
+        fn install(mut self) {
+            let o = self.obj.take().unwrap();
+            self.table.slots.borrow_mut()[self.fd as usize] = Slot::Open(o);
+        }
+    }
+
+    impl<T> Drop for FakeFd<'_, T> {
+        /// setf(fd, NULL) and unfalloc: the descriptor is free again, and
+        /// the file goes with its object reference.
+        fn drop(&mut self) {
+            if let Some(o) = self.obj.take() {
+                self.table.slots.borrow_mut()[self.fd as usize] = Slot::Free;
+                drop(o);
+            }
+        }
+    }
+
+    /// The facade driver's copy-out: the kernel copy of the argument to the
+    /// caller's memory, `EFAULT` if that is not writable.
+    fn copy_out(kernel: &Cell<i32>, user: &Cell<i32>, fault: bool) -> Result<(), Errno> {
+        if fault {
+            return Err(Errno::EFAULT);
+        }
+        user.set(kernel.get());
+        Ok(())
+    }
+
+    /// What the facade's installers do from inside a handler: ask the
+    /// frame's list for a descriptor whose file holds `obj`.
+    fn request<'t, T>(p: NonNull<PendingFds<FakeFd<'t, T>>>, table: &'t FakeTable<T>, obj: T) -> Result<i32, Errno> {
+        // SAFETY: the list of the running install_after, used on its
+        // thread while the handler runs, as through the frame.
+        defer_fd(Some(unsafe { &mut *p.as_ptr() }), || Ok(table.reserve(obj)))
+    }
+
+    /// An out-fence's sync file (drm_sync_file_install): `fault` makes the
+    /// final copy-out fail.
+    fn sync_file_ioctl(fault: bool) {
+        let ctx = sleep();
+        let d = FenceDomain::new_test(&ctx);
+        let f = Fence::new(&d, d.alloc_contexts(1), 1, &ctx).unwrap();
+        let before = f.refs();
+        let table = FakeTable::new();
+        let (kernel, user) = (Cell::new(-1), Cell::new(-1));
+        let r = install_after(
+            |p| {
+                let fd = request(p, &table, f.clone())?;
+                assert_eq!(table.state(fd), "reserved", "not visible while the handler runs");
+                assert_eq!(f.refs(), before + 1, "the reserved file holds the fence");
+                kernel.set(fd);
+                Ok(())
+            },
+            || copy_out(&kernel, &user, fault),
+        );
+        if fault {
+            assert_eq!(r, Err(Errno::EFAULT));
+            assert_eq!(user.get(), -1);
+            assert!(table.all_free(), "no descriptor installed, the slot free again");
+            assert_eq!(f.refs(), before, "the file's fence reference went");
+            assert_eq!(table.reserve(f.clone()).fd(), kernel.get(), "the number is free for reuse");
+        } else {
+            assert_eq!(r, Ok(()));
+            assert_eq!(user.get(), kernel.get(), "the caller learns the number");
+            assert_eq!(table.state(user.get()), "open");
+            assert_eq!(f.refs(), before + 1, "the installed file holds the fence");
+            drop(table.close(user.get()));
+        }
+        assert_eq!(f.refs(), before);
+        drop(f);
+        d.drain(&ctx);
+        assert_eq!(d.stats.live(), [0; 8]);
+    }
+
+    #[test]
+    fn sync_file_installed_after_copy_out() {
+        sync_file_ioctl(false);
+    }
+
+    #[test]
+    fn sync_file_copy_out_fault_installs_nothing() {
+        sync_file_ioctl(true);
+    }
+
+    /// A dma-buf export (dma_buf_fd): the descriptor's file holds its own
+    /// object reference and takes over the caller's dma-buf reference on
+    /// success, as on Linux.
+    fn dmabuf_ioctl(fault: bool) {
+        let ctx = sleep();
+        let obj = KArc::new(7u32, &ctx).unwrap();
+        let before = KArc::strong_count(&obj);
+        let table = FakeTable::new();
+        let (kernel, user) = (Cell::new(-1), Cell::new(-1));
+        let r = install_after(
+            |p| {
+                // drm_gem_prime_export: the caller's dma-buf reference.
+                let dmabuf = obj.clone();
+                let fd = request(p, &table, obj.clone())?;
+                drop(dmabuf);
+                assert_eq!(table.state(fd), "reserved");
+                kernel.set(fd);
+                Ok(())
+            },
+            || copy_out(&kernel, &user, fault),
+        );
+        if fault {
+            assert_eq!(r, Err(Errno::EFAULT));
+            assert!(table.all_free());
+            assert_eq!(KArc::strong_count(&obj), before, "the object is back to its references before the ioctl");
+        } else {
+            assert_eq!(r, Ok(()));
+            assert_eq!(user.get(), kernel.get());
+            assert_eq!(table.state(user.get()), "open");
+            assert_eq!(KArc::strong_count(&obj), before + 1, "the installed file holds the object");
+            drop(table.close(user.get()));
+            assert_eq!(KArc::strong_count(&obj), before);
+        }
+    }
+
+    #[test]
+    fn dmabuf_installed_after_copy_out() {
+        dmabuf_ioctl(false);
+    }
+
+    #[test]
+    fn dmabuf_copy_out_fault_installs_nothing() {
+        dmabuf_ioctl(true);
+    }
+
+    #[test]
+    fn handler_error_after_request_installs_nothing() {
+        let ctx = sleep();
+        let obj = KArc::new(1u32, &ctx).unwrap();
+        let table = FakeTable::new();
+        let copied = Cell::new(false);
+        let r = install_after(
+            |p| {
+                let fd = request(p, &table, obj.clone())?;
+                assert_eq!(table.state(fd), "reserved");
+                Err(Errno::EIO)
+            },
+            || {
+                copied.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(r, Err(Errno::EIO));
+        assert!(!copied.get(), "a failed handler's argument is not copied out");
+        assert!(table.all_free());
+        assert_eq!(KArc::strong_count(&obj), 1);
+    }
+
+    #[test]
+    fn two_requests_in_one_ioctl() {
+        let ctx = sleep();
+        let obj = KArc::new(2u32, &ctx).unwrap();
+        for fault in [false, true] {
+            let table = FakeTable::new();
+            let (k1, k2, u1, u2) = (Cell::new(-1), Cell::new(-1), Cell::new(-1), Cell::new(-1));
+            let r = install_after(
+                |p| {
+                    k1.set(request(p, &table, obj.clone())?);
+                    k2.set(request(p, &table, obj.clone())?);
+                    assert_ne!(k1.get(), k2.get(), "two numbers");
+                    // SAFETY: as in request.
+                    assert_eq!(unsafe { p.as_ref() }.len(), 2);
+                    Ok(())
+                },
+                || copy_out(&k1, &u1, false).and_then(|()| copy_out(&k2, &u2, fault)),
+            );
+            if fault {
+                assert_eq!(r, Err(Errno::EFAULT));
+                assert!(table.all_free(), "both given up");
+                assert_eq!(KArc::strong_count(&obj), 1);
+            } else {
+                assert_eq!(r, Ok(()));
+                assert_eq!((u1.get(), u2.get()), (k1.get(), k2.get()));
+                assert_eq!((table.state(u1.get()), table.state(u2.get())), ("open", "open"));
+                assert_eq!(KArc::strong_count(&obj), 3);
+                drop((table.close(u1.get()), table.close(u2.get())));
+                assert_eq!(KArc::strong_count(&obj), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn requests_beyond_the_bound_fail_without_opening() {
+        let ctx = sleep();
+        let obj = KArc::new(3u32, &ctx).unwrap();
+        let table = FakeTable::new();
+        let opened = Cell::new(0);
+        let r = install_after(
+            |p| {
+                for _ in 0..MAX_PENDING_FDS {
+                    request(p, &table, obj.clone())?;
+                }
+                // SAFETY: as in request.
+                let more = defer_fd(Some(unsafe { &mut *p.as_ptr() }), || {
+                    opened.set(opened.get() + 1);
+                    Ok(table.reserve(obj.clone()))
+                });
+                assert_eq!(more, Err(Errno::EMFILE));
+                assert_eq!(opened.get(), 0, "no file opened for the refused request");
+                more.map(|_| ())
+            },
+            || Ok(()),
+        );
+        assert_eq!(r, Err(Errno::EMFILE));
+        assert!(table.all_free());
+        assert_eq!(KArc::strong_count(&obj), 1);
+    }
+
+    #[test]
+    fn request_outside_an_ioctl_fails_without_opening() {
+        let table: FakeTable<u32> = FakeTable::new();
+        let opened = Cell::new(false);
+        let r = defer_fd::<FakeFd<'_, u32>>(None, || {
+            opened.set(true);
+            Ok(table.reserve(0))
+        });
+        assert_eq!(r, Err(Errno::EINVAL));
+        assert!(!opened.get());
+        assert!(table.all_free());
     }
 }

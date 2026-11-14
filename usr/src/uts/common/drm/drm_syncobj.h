@@ -58,6 +58,14 @@ extern int drm_syncobj_find_fence(struct drm_file *file_private,
  * calling process for it (with O_CLOEXEC if `cloexec`). Only inside an
  * ioctl handler. Returns 0 and the descriptor in *fdp, or a negative
  * errno.
+ *
+ * The descriptor becomes visible to the process only if the ioctl returns
+ * success: the core installs it after the handler has returned 0 and the
+ * argument has been copied out, and gives it up otherwise (Linux's i915
+ * installs its out-fence in the handler, before that copy). Until then
+ * the number is reserved but not open, so the handler only passes it on
+ * in its argument. At most four descriptors per ioctl (-EMFILE beyond);
+ * -EINVAL outside an ioctl handler.
  */
 extern int drm_sync_file_install(struct dma_fence *fence, bool cloexec,
     int *fdp);

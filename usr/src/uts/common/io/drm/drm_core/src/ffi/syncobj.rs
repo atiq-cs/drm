@@ -135,35 +135,23 @@ pub unsafe extern "C" fn drm_sync_file_install(fence: *mut f::dma_fence, cloexec
     }
     // SAFETY: the caller holds the fence.
     let Some(fc) = (unsafe { super::fence::core_fence(fence) }) else { return neg(Errno::EINVAL) };
-    let r = crate::ctxt::with_current(|frame, arg| {
+    // Reserved now, installed by the facade driver after the ioctl's
+    // copy-out (EINVAL outside a driver ioctl).
+    let r = crate::ctxt::reserve_fd(|frame, arg| {
         // SAFETY: the frame's device is the ioctl's, registered while it
         // runs.
         let core = unsafe { frame.core.as_ref() };
         let d = core.device().ok_or(Errno::ENODEV)?;
-        let mut out = -1;
-        d.sync().export_sync_file(
-            fc.clone(),
-            b"drm",
-            cloexec,
-            arg,
-            |fd| {
-                out = fd;
-                Ok(())
-            },
-            &ctx,
-        )?;
-        Ok(out)
+        d.sync().sync_file_fd(fc.clone(), b"drm", cloexec, arg, &ctx)
     });
     fc.put(Ctx::Sleep(&ctx));
     match r {
-        Some(Ok(fd)) => {
+        Ok(fd) => {
             // SAFETY: checked above.
             unsafe { *fdp = fd };
             0
         }
-        Some(Err(e)) => neg(e),
-        // Outside an ioctl handler there is no process to give it to.
-        None => neg(Errno::EINVAL),
+        Err(e) => neg(e),
     }
 }
 

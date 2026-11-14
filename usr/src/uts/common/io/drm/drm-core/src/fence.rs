@@ -853,6 +853,11 @@ impl Fence {
     pub fn ptr_eq(a: &Fence, b: &Fence) -> bool {
         KArc::ptr_eq(&a.arc, &b.arc)
     }
+    /// Returns the number of references, for host tests.
+    #[cfg(test)]
+    pub(crate) fn refs(&self) -> usize {
+        KArc::strong_count(&self.arc)
+    }
     /// Reports whether the fence has signalled.
     pub fn is_signaled(&self) -> bool {
         self.inner().flags.load(Ordering::Acquire) & SIGNALED != 0
