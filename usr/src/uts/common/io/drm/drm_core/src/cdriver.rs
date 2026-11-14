@@ -75,14 +75,23 @@ impl CDriver {
         // SAFETY: k <= 255 bytes of buf.
         unsafe { a.copy_in_struct(buf.0.as_mut_ptr(), k)? };
         let ddev = core.ddev();
-        let r = crate::ctxt::with_frame(self.core, (entry.cmd, cmd), arg, ctx, || {
-            // SAFETY: the driver's handler with its device, a buffer of the
-            // table's size and its file.
-            unsafe { func(ddev, buf.0.as_mut_ptr().cast(), fp.as_ptr()) }
-        })?;
-        from_neg(r)?;
-        // SAFETY: k initialised bytes.
-        unsafe { a.copy_out_struct(buf.0.as_ptr(), k) }
+        let data = buf.0.as_mut_ptr();
+        // The descriptors the handler asks for (dma_buf_fd,
+        // drm_sync_file_install) carry their numbers in the kernel copy of
+        // the argument; they become visible only after it has been copied
+        // out, and a failed handler or copy-out gives them up.
+        drm_core::anon_fd::install_after(
+            |pending| {
+                let r = crate::ctxt::with_frame(self.core, (entry.cmd, cmd), arg, Some(pending), ctx, || {
+                    // SAFETY: the driver's handler with its device, a buffer
+                    // of the table's size and its file.
+                    unsafe { func(ddev, data.cast(), fp.as_ptr()) }
+                })?;
+                from_neg(r)
+            },
+            // SAFETY: k initialised bytes.
+            || unsafe { a.copy_out_struct(data, k) },
+        )
     }
 }
 
@@ -187,8 +196,11 @@ impl Driver for CDriver {
         let ddev = core.ddev();
         // The frame lets the KMS code's copies of the arrays an argument
         // points to (copy_to_user and friends over drm_copy_to_user) find
-        // the ioctl's data model.
-        let r = crate::ctxt::with_frame(self.core, cmds, arg, ctx, || {
+        // the ioctl's data model. It has no descriptor list: the core copies
+        // this argument out (lkms::forward_ioctl), so a descriptor request
+        // fails instead of installing at once; the KMS code makes none
+        // (get_unused_fd_flags fails).
+        let r = crate::ctxt::with_frame(self.core, cmds, arg, None, ctx, || {
             // SAFETY: the KMS code's handler with its device, the kernel
             // copy of the argument (the table's size) and the file.
             unsafe { ioctl(ddev, nr, data.as_mut_ptr().cast(), fp.as_ptr()) }

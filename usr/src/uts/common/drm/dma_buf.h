@@ -89,6 +89,14 @@ extern struct dma_buf *dma_buf_get(int fd);
  * As on Linux, a descriptor takes over the caller's reference: on success
  * the caller must not dma_buf_put() it; on failure the caller still owns
  * it. Only inside an ioctl handler.
+ *
+ * The descriptor becomes visible to the process only if the ioctl returns
+ * success: the core installs it after the handler has returned 0 and the
+ * argument has been copied out, and gives it up otherwise (the reference
+ * it took over goes with it). Until then the number is reserved but not
+ * open, so the handler only passes it on in its argument. At most four
+ * descriptors per ioctl (-EMFILE beyond); -EINVAL outside an ioctl
+ * handler.
  */
 extern int dma_buf_fd(struct dma_buf *dmabuf, int flags);
 

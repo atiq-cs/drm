@@ -106,6 +106,26 @@ descriptor with `setf()`; if the copy fails, the open is undone
 (`VOP_CLOSE`, which ends in `close(9E)`, `setf(fd, NULL)`, `unfalloc()`,
 `VN_RELE`), so a failed ioctl leaves no descriptor behind.
 
+**Descriptors of driver ioctls.** A driver's handler gets its descriptor
+from the facade (`dma_buf_fd`, `drm_sync_file_install`) while its
+argument is still the kernel's copy, which `misc/drm_core` copies out only
+after the handler has returned. Until 14 November 2026 the facade
+installed the descriptor at once, so a copy-out that failed (`EFAULT`)
+left the process a descriptor whose number it never learned, open until
+it exited. The facade now only opens the file and reserves the number
+(`falloc()`), records it in the ioctl's frame (`PendingFds` in
+`anon_fd.rs`, at most four per ioctl), and `CDriver::call` installs them
+with `setf()` after the copy-out succeeded, or undoes them as above when
+the handler or the copy-out failed. This is the order of `pipe(2)`
+(`falloc()`, `copyout()`, `setf()`) and stricter than Linux, whose i915
+installs its out-fence inside the handler; closing an installed
+descriptor after the fact would race with the process's other threads.
+Until then the number is reserved but not open: `getf()`
+fails, `close(2)` answers `EBADF`, `dup2(2)` onto it waits for the
+`setf()`, `fork(2)` leaves it out of the child, and no other open takes
+it (`uts/common/os/fio.c`). The file stays locked (`falloc()` returns it
+with `f_tlock` held) until then; nothing else can find it.
+
 **One dma-buf per object.** While a GEM object's dma-buf file is open,
 exporting the object again opens the same minor again (Linux keeps
 `obj->dma_buf`), so both descriptors have the same `st_rdev`. If that

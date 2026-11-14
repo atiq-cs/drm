@@ -13,16 +13,28 @@
 //! driver records a frame for the calling thread around the handler.
 //! Ioctls of one file may run on several threads at once, so the table is
 //! keyed by the thread (`ddi_get_kt_did(9F)`).
+//!
+//! The frame of a driver ioctl also points to the list of descriptors its
+//! handler asked for (`dma_buf_fd`, `drm_sync_file_install`): they are
+//! reserved, and `CDriver::call` installs them only after it has copied
+//! the argument that carries their numbers out (`drm_core::anon_fd`).
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
+use ddi::private::fd::NewFd;
 use ddi::sys;
 use ddi::{Errno, IoctlArg, Sleepable};
+use drm_core::anon_fd::PendingFds;
 use drm_core::ksync::KMutex;
 use drm_core::kvec::KVec;
 
 use crate::devcore::DevCore;
+
+/// The descriptors a driver ioctl asked for. A `NewFd` borrows the
+/// argument of its ioctl; the list reached through the frame names it with
+/// the lifetime erased (see `reserve_fd`).
+pub(crate) type Pending = PendingFds<NewFd<'static>>;
 
 /// One ioctl in progress.
 #[derive(Clone, Copy)]
@@ -35,6 +47,11 @@ pub(crate) struct Frame {
     /// The matched table entry's command and the caller's.
     pub(crate) entry_cmd: u32,
     pub(crate) user_cmd: u32,
+    /// The descriptors the handler asked for, on the stack of
+    /// `CDriver::call`, which installs them after its copy-out; `None` for
+    /// an ioctl whose argument the core copies out elsewhere (the KMS
+    /// code's), where requests fail.
+    pending: Option<NonNull<Pending>>,
 }
 
 // SAFETY: the pointers are only followed by the recording thread, while
@@ -73,11 +90,14 @@ fn current() -> sys::kt_did_t {
     unsafe { sys::ddi_get_kt_did() }
 }
 
-/// Runs `f` with a frame for the calling thread recorded.
+/// Runs `f` with a frame for the calling thread recorded, with `pending`
+/// as its list of requested descriptors. The caller keeps the list alive
+/// and does not use it until this function has returned.
 pub(crate) fn with_frame<R>(
     core: NonNull<DevCore>,
     cmds: (u32, u32),
     arg: &IoctlArg<'_>,
+    pending: Option<NonNull<Pending>>,
     ctx: &Sleepable,
     f: impl FnOnce() -> R,
 ) -> Result<R, Errno> {
@@ -85,7 +105,8 @@ pub(crate) fn with_frame<R>(
     // SAFETY: the lifetime is erased for the table; the frame is removed
     // before this function returns, while `arg` is still borrowed.
     let arg = unsafe { NonNull::new_unchecked(arg as *const IoctlArg<'_> as *mut IoctlArg<'static>) };
-    table().lock().push(Frame { thread: me, arg, core, entry_cmd: cmds.0, user_cmd: cmds.1 }, ctx)?;
+    let fr = Frame { thread: me, arg, core, entry_cmd: cmds.0, user_cmd: cmds.1, pending };
+    table().lock().push(fr, ctx)?;
     let r = f();
     let mut t = table().lock();
     // The newest frame of this thread is this one (a handler does not
@@ -105,4 +126,28 @@ pub(crate) fn with_current<R>(f: impl FnOnce(&Frame, &IoctlArg<'_>) -> R) -> Opt
     // handler returns, which cannot happen during this call.
     let arg = unsafe { fr.arg.as_ref() };
     Some(f(&fr, arg))
+}
+
+/// Asks for a new descriptor of the calling process for the calling
+/// thread's driver ioctl: `open` reserves it with the ioctl's argument, and
+/// its number is returned for the handler's argument. The descriptor
+/// becomes visible only if the handler succeeds and its argument is copied
+/// out (`CDriver::call`). Outside a handler there is no process to give it
+/// to, and an ioctl without a list cannot install it later: `EINVAL`
+/// without calling `open` (`drm_core::anon_fd::defer_fd`).
+pub(crate) fn reserve_fd(
+    open: impl for<'f, 'b, 'c> FnOnce(&'f Frame, &'b IoctlArg<'c>) -> Result<NewFd<'b>, Errno>,
+) -> Result<i32, Errno> {
+    let me = current();
+    let Some(fr) = table().lock().iter().rev().find(|fr| fr.thread == me).copied() else { return Err(Errno::EINVAL) };
+    // SAFETY: the list of this thread's CDriver::call, which keeps it on
+    // its stack while the frame is recorded and uses it only after the
+    // handler, which runs on this thread, has returned.
+    let pending = fr.pending.map(|mut p| unsafe { p.as_mut() });
+    // SAFETY: the frame is this thread's (see with_current). The 'static
+    // lifetime is the erasure the list's type needs: a NewFd made for
+    // `arg` goes into the list, which CDriver::call commits or drops
+    // before the frame is removed, while it still borrows the argument.
+    let arg: &'static IoctlArg<'static> = unsafe { fr.arg.as_ref() };
+    drm_core::anon_fd::defer_fd(pending, || open(&fr, arg))
 }
